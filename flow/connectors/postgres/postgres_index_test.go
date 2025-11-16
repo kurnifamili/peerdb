@@ -67,7 +67,7 @@ func (s PostgresIndexTestSuite) Teardown(ctx context.Context) {
 	require.Error(s.t, s.connector.ConnectionActive(ctx))
 }
 
-func (s PostgresIndexTestSuite) TestGetAllIndexes() {
+func (s PostgresIndexTestSuite) TestGetIndexes() {
 	tableName := "test_indexes"
 	fullyQualifiedTable := fmt.Sprintf("%s.%s", s.schema, tableName)
 
