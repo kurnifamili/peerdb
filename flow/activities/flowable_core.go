@@ -108,6 +108,24 @@ func (a *FlowableActivity) applySchemaDeltas(
 	return nil
 }
 
+// detectSchemaDrift polls the source schema directly so we can replay pure DDL changes
+// even when the WAL is idle (for example, DROP COLUMN without follow-up writes).
+func (a *FlowableActivity) detectSchemaDrift(
+	ctx context.Context,
+	config *protos.FlowConnectionConfigsCore,
+	options *protos.SyncFlowOptions,
+	srcConn connectors.CDCPullConnectorCore,
+	currentSchema map[string]*protos.TableSchema,
+) ([]*protos.TableSchemaDelta, error) {
+	logger := internal.LoggerFromCtx(ctx)
+	latestSchema, err := srcConn.GetTableSchema(ctx, config.Env, config.Version, config.System, options.TableMappings)
+	if err != nil {
+		return nil, fmt.Errorf("failed to refresh table schema from source: %w", err)
+	}
+	processed := internal.BuildProcessedSchemaMapping(options.TableMappings, latestSchema, logger)
+	return internal.ComputeSchemaDrift(options.TableMappings, currentSchema, processed), nil
+}
+
 func syncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDCSyncConnectorCore, Items model.Items](
 	ctx context.Context,
 	a *FlowableActivity,
@@ -226,6 +244,22 @@ func syncCore[TPull connectors.CDCPullConnectorCore, TSync connectors.CDCSyncCon
 			}
 		}
 		logger.Info("no records to push")
+
+		if len(recordBatchSync.SchemaDeltas) == 0 {
+			// No WAL activity was seen for this batch, so compare the latest source schema with what we last applied.
+			// This keeps schema-only changes moving.
+			driftDeltas, err := a.detectSchemaDrift(ctx, config, options, srcConn, tableNameSchemaMapping)
+			if err != nil {
+				return nil, err
+			}
+			if len(driftDeltas) > 0 {
+				logger.Info("detected schema drift without WAL activity", slog.Int("numDeltas", len(driftDeltas)))
+				recordBatchSync.SchemaDeltas = append(recordBatchSync.SchemaDeltas, driftDeltas...)
+			} else {
+				// no schema changes detected and no drift detected
+				return nil, nil
+			}
+		}
 
 		dstConn, dstClose, err := connectors.GetByNameAs[TSync](ctx, config.Env, a.CatalogPool, config.DestinationName)
 		if err != nil {
