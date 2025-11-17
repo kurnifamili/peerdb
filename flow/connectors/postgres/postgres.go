@@ -1114,6 +1114,11 @@ func (c *PostgresConnector) SetupNormalizedTable(
 		return false, err
 	}
 
+	// Setup triggers from source table on destination table
+	if err := c.setupTriggers(ctx, config, tableIdentifier, parsedNormalizedTable, createNormalizedTablesTx); err != nil {
+		return false, err
+	}
+
 	return false, nil
 }
 
@@ -1190,6 +1195,66 @@ func (c *PostgresConnector) setupIndexes(
 				slog.String("table", tableIdentifier),
 				slog.Any("error", err))
 			// Don't fail if a single index fails to create
+		}
+	}
+
+	return nil
+}
+
+// setupTriggers creates triggers on destination table based on source table triggers during initial setup.
+func (c *PostgresConnector) setupTriggers(
+	ctx context.Context,
+	config *protos.SetupNormalizedTableBatchInput,
+	tableIdentifier string,
+	parsedNormalizedTable *utils.SchemaTable,
+	tx pgx.Tx,
+) error {
+	srcTableIdentifier := c.getSourceTableIdentifier(config.TableMappings, tableIdentifier)
+	if srcTableIdentifier == "" {
+		c.logger.Warn("[postgres] no source table mapping found for destination table",
+			slog.String("destinationTable", tableIdentifier))
+		return nil
+	}
+
+	srcSchemaTable, err := utils.ParseSchemaTable(srcTableIdentifier)
+	if err != nil {
+		return fmt.Errorf("failed to parse source table %s: %w", srcTableIdentifier, err)
+	}
+
+	// Get all triggers from source table
+	triggers, err := c.GetTriggers(ctx, srcSchemaTable)
+	if err != nil {
+		c.logger.Warn("[postgres] failed to get triggers for source table",
+			slog.String("sourceTable", srcTableIdentifier),
+			slog.Any("error", err))
+		// Don't fail the entire setup if trigger migration fails
+		return nil
+	}
+
+	if len(triggers) == 0 {
+		return nil
+	}
+
+	c.logger.Info("[postgres] setting up triggers on destination table",
+		slog.String("sourceTable", srcTableIdentifier),
+		slog.String("destinationTable", tableIdentifier),
+		slog.Int("triggerCount", len(triggers)))
+
+	for _, trigger := range triggers {
+		// Modify trigger definition to use destination table name
+		triggerDef := strings.ReplaceAll(trigger.TriggerDef, srcSchemaTable.String(), parsedNormalizedTable.String())
+
+		c.logger.Info("[postgres] creating trigger",
+			slog.String("trigger", trigger.TriggerName),
+			slog.String("table", tableIdentifier))
+
+		if _, err := c.execWithLoggingTx(ctx, triggerDef, tx); err != nil {
+			c.logger.Warn("[postgres] failed to create trigger, continuing",
+				slog.String("trigger", trigger.TriggerName),
+				slog.String("table", tableIdentifier),
+				slog.Any("error", err))
+			// Don't fail if a single trigger fails to create
+			// This could happen if trigger functions are missing on destination
 		}
 	}
 
