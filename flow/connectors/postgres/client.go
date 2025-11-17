@@ -731,10 +731,10 @@ func (c *PostgresConnector) IsInRecovery(ctx context.Context) (bool, error) {
 // IndexMetadata represents metadata about a PostgreSQL index
 type IndexMetadata struct {
 	IndexName string   `db:"index_name"`
+	IndexDef  string   `db:"index_def"`
+	Columns   []string `db:"columns"`
 	IsUnique  bool     `db:"is_unique"`
 	IsPrimary bool     `db:"is_primary"`
-	Columns   []string `db:"columns"`
-	IndexDef  string   `db:"index_def"`
 }
 
 // GetIndexes retrieves all indexes for a given table.

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1291,10 +1292,19 @@ func (c *PostgresConnector) setupTriggers(
 // with the destination equivalent so we can re-use index/trigger definitions verbatim.
 func rewriteTableIdentifierInSQL(sql string, src, dst *utils.SchemaTable) string {
 	replacements := []struct{ old, new string }{
-		{src.String(), dst.String()},
-		{fmt.Sprintf("%s.%s", src.Schema, src.Table), fmt.Sprintf("%s.%s", dst.Schema, dst.Table)},
-		{fmt.Sprintf("%s.%s", utils.QuoteIdentifier(src.Schema), src.Table), fmt.Sprintf("%s.%s", utils.QuoteIdentifier(dst.Schema), dst.Table)},
-		{fmt.Sprintf("%s.%s", src.Schema, utils.QuoteIdentifier(src.Table)), fmt.Sprintf("%s.%s", dst.Schema, utils.QuoteIdentifier(dst.Table))},
+		{old: src.String(), new: dst.String()},
+		{
+			old: fmt.Sprintf("%s.%s", src.Schema, src.Table),
+			new: fmt.Sprintf("%s.%s", dst.Schema, dst.Table),
+		},
+		{
+			old: fmt.Sprintf("%s.%s", utils.QuoteIdentifier(src.Schema), src.Table),
+			new: fmt.Sprintf("%s.%s", utils.QuoteIdentifier(dst.Schema), dst.Table),
+		},
+		{
+			old: fmt.Sprintf("%s.%s", src.Schema, utils.QuoteIdentifier(src.Table)),
+			new: fmt.Sprintf("%s.%s", dst.Schema, utils.QuoteIdentifier(dst.Table)),
+		},
 	}
 
 	for _, replacement := range replacements {
@@ -1313,12 +1323,27 @@ func rewriteIndexNameInSQL(sql string, src, dst *utils.SchemaTable, originalName
 	sanitizedOriginal := sanitizeIdentifier(originalName)
 	sanitizedReplacement := sanitizeIdentifier(replacementName)
 	replacements := []struct{ old, new string }{
-		{fmt.Sprintf("\"%s\".\"%s\"", src.Schema, sanitizedOriginal), fmt.Sprintf("\"%s\".\"%s\"", dst.Schema, sanitizedReplacement)},
-		{fmt.Sprintf("\"%s\".%s", src.Schema, sanitizedOriginal), fmt.Sprintf("\"%s\".%s", dst.Schema, sanitizedReplacement)},
-		{fmt.Sprintf("%s.\"%s\"", src.Schema, sanitizedOriginal), fmt.Sprintf("%s.\"%s\"", dst.Schema, sanitizedReplacement)},
-		{fmt.Sprintf("%s.%s", src.Schema, sanitizedOriginal), fmt.Sprintf("%s.%s", dst.Schema, sanitizedReplacement)},
-		{fmt.Sprintf("\"%s\"", sanitizedOriginal), fmt.Sprintf("\"%s\"", sanitizedReplacement)},
-		{sanitizedOriginal, sanitizedReplacement},
+		{
+			old: fmt.Sprintf("\"%s\".\"%s\"", src.Schema, sanitizedOriginal),
+			new: fmt.Sprintf("\"%s\".\"%s\"", dst.Schema, sanitizedReplacement),
+		},
+		{
+			old: fmt.Sprintf("\"%s\".%s", src.Schema, sanitizedOriginal),
+			new: fmt.Sprintf("\"%s\".%s", dst.Schema, sanitizedReplacement),
+		},
+		{
+			old: fmt.Sprintf("%s.\"%s\"", src.Schema, sanitizedOriginal),
+			new: fmt.Sprintf("%s.\"%s\"", dst.Schema, sanitizedReplacement),
+		},
+		{
+			old: fmt.Sprintf("%s.%s", src.Schema, sanitizedOriginal),
+			new: fmt.Sprintf("%s.%s", dst.Schema, sanitizedReplacement),
+		},
+		{
+			old: fmt.Sprintf("\"%s\"", sanitizedOriginal),
+			new: fmt.Sprintf("\"%s\"", sanitizedReplacement),
+		},
+		{old: sanitizedOriginal, new: sanitizedReplacement},
 	}
 
 	for _, replacement := range replacements {
@@ -1358,7 +1383,7 @@ func buildDestinationIndexName(sourceName string, dst *utils.SchemaTable) string
 
 	hasher := fnv.New32a()
 	_, _ = hasher.Write([]byte(candidate))
-	hashSuffix := fmt.Sprintf("%x", hasher.Sum32())
+	hashSuffix := strconv.FormatUint(uint64(hasher.Sum32()), 16)
 	maxPrefixLen := postgresIdentifierMaxLength - len(hashSuffix) - 1
 	if maxPrefixLen < 1 {
 		maxPrefixLen = 1
@@ -1367,28 +1392,28 @@ func buildDestinationIndexName(sourceName string, dst *utils.SchemaTable) string
 	if len(runes) > maxPrefixLen {
 		runes = runes[:maxPrefixLen]
 	}
-	return fmt.Sprintf("%s_%s", string(runes), hashSuffix)
+	return string(runes) + "_" + hashSuffix
 }
 
 // execOptionalDDL wraps index/trigger creation in a SAVEPOINT so failures don't abort
 // the entire table setup transaction. We only bubble up the original error.
 func (c *PostgresConnector) execOptionalDDL(ctx context.Context, tx pgx.Tx, ddl string) error {
 	savepointName := fmt.Sprintf("peerdb_optional_%d", c.optionalDDLSavepointCounter.Add(1))
-	if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", savepointName)); err != nil {
+	if _, err := tx.Exec(ctx, "SAVEPOINT "+savepointName); err != nil {
 		return fmt.Errorf("failed to create savepoint %s: %w", savepointName, err)
 	}
 
 	if _, err := c.execWithLoggingTx(ctx, ddl, tx); err != nil {
-		if _, rbErr := tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", savepointName)); rbErr != nil {
+		if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT "+savepointName); rbErr != nil {
 			return fmt.Errorf("failed to rollback to savepoint %s after error (%v): %w", savepointName, err, rbErr)
 		}
-		if _, relErr := tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", savepointName)); relErr != nil {
+		if _, relErr := tx.Exec(ctx, "RELEASE SAVEPOINT "+savepointName); relErr != nil {
 			return fmt.Errorf("failed to release savepoint %s after rollback: %w", savepointName, relErr)
 		}
 		return err
 	}
 
-	if _, err := tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", savepointName)); err != nil {
+	if _, err := tx.Exec(ctx, "RELEASE SAVEPOINT "+savepointName); err != nil {
 		return fmt.Errorf("failed to release savepoint %s: %w", savepointName, err)
 	}
 

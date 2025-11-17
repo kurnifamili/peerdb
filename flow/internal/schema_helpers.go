@@ -125,7 +125,7 @@ func ComputeSchemaDrift(
 		mappingByDst[tm.DestinationTableIdentifier] = tm
 	}
 
-	var deltas []*protos.TableSchemaDelta
+	deltas := make([]*protos.TableSchemaDelta, 0, len(latest))
 	for dstName, latestSchema := range latest {
 		mapping, ok := mappingByDst[dstName]
 		if !ok {

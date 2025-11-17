@@ -173,7 +173,7 @@ func (s PostgresIndexTestSuite) TestGetAllIndexesNonexistentTable() {
 	})
 	require.NoError(s.t, err)
 	require.NotNil(s.t, indexes)
-	require.Len(s.t, indexes, 0) // Should return empty slice, not error
+	require.Empty(s.t, indexes) // Should return empty slice, not error
 }
 
 func TestPostgresIndexTestSuite(t *testing.T) {
