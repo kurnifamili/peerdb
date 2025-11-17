@@ -1178,8 +1178,15 @@ func processRelationMessage[Items model.Items](
 	for _, column := range prevSchema.Columns {
 		// present in previous relation message, but not in current one, so dropped.
 		if _, ok := currRelMap[column.Name]; !ok {
-			p.logger.Warn(fmt.Sprintf("Detected dropped column %s in table %s, but not propagating", column,
-				schemaDelta.SrcTableName))
+			schemaDelta.DroppedColumns = append(schemaDelta.DroppedColumns, &protos.FieldDescription{
+				Name:         column.Name,
+				Type:         column.Type,
+				TypeModifier: column.TypeModifier,
+			})
+			p.logger.Info("Detected dropped column",
+				slog.String("columnName", column.Name),
+				slog.String("columnType", column.Type),
+				slog.String("relationName", schemaDelta.SrcTableName))
 		}
 	}
 	if len(potentiallyNullableAddedColumns) > 0 {
@@ -1214,7 +1221,7 @@ func processRelationMessage[Items model.Items](
 
 	p.relationMessageMapping[currRel.RelationID] = currRel
 	// only log audit if there is actionable delta
-	if len(schemaDelta.AddedColumns) > 0 {
+	if len(schemaDelta.AddedColumns) > 0 || len(schemaDelta.DroppedColumns) > 0 {
 		return &model.RelationRecord[Items]{
 			BaseRecord:       p.baseRecord(lsn),
 			TableSchemaDelta: schemaDelta,
