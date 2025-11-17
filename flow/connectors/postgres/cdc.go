@@ -792,9 +792,15 @@ func PullCdcRecords[Items model.Items](
 
 					case *model.RelationRecord[Items]:
 						tableSchemaDelta := r.TableSchemaDelta
-						if len(tableSchemaDelta.AddedColumns) > 0 {
-							logger.Info(fmt.Sprintf("Detected schema change for table %s, addedColumns: %v",
-								tableSchemaDelta.SrcTableName, tableSchemaDelta.AddedColumns))
+						if hasSchemaChanges(tableSchemaDelta) {
+							if len(tableSchemaDelta.AddedColumns) > 0 {
+								logger.Info(fmt.Sprintf("Detected schema change for table %s, addedColumns: %v",
+									tableSchemaDelta.SrcTableName, tableSchemaDelta.AddedColumns))
+							}
+							if len(tableSchemaDelta.DroppedColumns) > 0 {
+								logger.Info(fmt.Sprintf("Detected schema change for table %s, droppedColumns: %v",
+									tableSchemaDelta.SrcTableName, tableSchemaDelta.DroppedColumns))
+							}
 							records.AddSchemaDelta(req.TableNameMapping, tableSchemaDelta)
 						}
 
@@ -1228,6 +1234,12 @@ func processRelationMessage[Items model.Items](
 		}, monitoring.AuditSchemaDelta(ctx, p.catalogPool.Pool, p.flowJobName, schemaDelta)
 	}
 	return nil, nil
+}
+
+// hasSchemaChanges guards downstream processing so we only emit relation records
+// when there's an actual add/drop, not just a keepalive relation refresh.
+func hasSchemaChanges(delta *protos.TableSchemaDelta) bool {
+	return delta != nil && (len(delta.AddedColumns) > 0 || len(delta.DroppedColumns) > 0)
 }
 
 // getParentRelIDIfPartitioned checks if the relation ID is a child table
