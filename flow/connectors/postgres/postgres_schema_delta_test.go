@@ -185,6 +185,216 @@ func (s PostgresSchemaDeltaTestSuite) TestAddDropWhitespaceColumnNames() {
 	require.Equal(s.t, expectedTableSchema, output[tableName])
 }
 
+func (s PostgresSchemaDeltaTestSuite) TestSimpleDropColumn() {
+	tableName := s.schema + ".simple_drop_column"
+	_, err := s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("CREATE TABLE %s(id INT PRIMARY KEY, col1 TEXT, col2 INT)", tableName))
+	require.NoError(s.t, err)
+
+	// Insert some data to ensure DROP works with existing data
+	_, err = s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("INSERT INTO %s(id, col1, col2) VALUES (1, 'test', 42)", tableName))
+	require.NoError(s.t, err)
+
+	// Drop col2
+	require.NoError(s.t, s.connector.ReplayTableSchemaDeltas(s.t.Context(), nil, "schema_delta_flow", nil, []*protos.TableSchemaDelta{{
+		SrcTableName: tableName,
+		DstTableName: tableName,
+		DroppedColumns: []*protos.FieldDescription{
+			{
+				Name:         "col2",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+		},
+	}}))
+
+	output, err := s.connector.GetTableSchema(s.t.Context(), nil, shared.InternalVersion_Latest, protos.TypeSystem_Q,
+		[]*protos.TableMapping{{SourceTableIdentifier: tableName}})
+	require.NoError(s.t, err)
+	require.Equal(s.t, &protos.TableSchema{
+		TableIdentifier:   tableName,
+		PrimaryKeyColumns: []string{"id"},
+		System:            protos.TypeSystem_Q,
+		Columns: []*protos.FieldDescription{
+			{
+				Name:         "id",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+			{
+				Name:         "col1",
+				Type:         string(types.QValueKindString),
+				TypeModifier: -1,
+				Nullable:     true,
+			},
+		},
+	}, output[tableName])
+
+	// Verify the data is still there
+	var id int
+	var col1 string
+	err = s.connector.conn.QueryRow(s.t.Context(),
+		fmt.Sprintf("SELECT id, col1 FROM %s WHERE id = 1", tableName)).Scan(&id, &col1)
+	require.NoError(s.t, err)
+	require.Equal(s.t, 1, id)
+	require.Equal(s.t, "test", col1)
+}
+
+func (s PostgresSchemaDeltaTestSuite) TestDropMultipleColumns() {
+	tableName := s.schema + ".drop_multiple_columns"
+	_, err := s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("CREATE TABLE %s(id INT PRIMARY KEY, col1 TEXT, col2 INT, col3 BOOLEAN)", tableName))
+	require.NoError(s.t, err)
+
+	// Drop col2 and col3
+	require.NoError(s.t, s.connector.ReplayTableSchemaDeltas(s.t.Context(), nil, "schema_delta_flow", nil, []*protos.TableSchemaDelta{{
+		SrcTableName: tableName,
+		DstTableName: tableName,
+		DroppedColumns: []*protos.FieldDescription{
+			{
+				Name:         "col2",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+			{
+				Name:         "col3",
+				Type:         string(types.QValueKindBoolean),
+				TypeModifier: -1,
+			},
+		},
+	}}))
+
+	output, err := s.connector.GetTableSchema(s.t.Context(), nil, shared.InternalVersion_Latest, protos.TypeSystem_Q,
+		[]*protos.TableMapping{{SourceTableIdentifier: tableName}})
+	require.NoError(s.t, err)
+	require.Equal(s.t, &protos.TableSchema{
+		TableIdentifier:   tableName,
+		PrimaryKeyColumns: []string{"id"},
+		System:            protos.TypeSystem_Q,
+		Columns: []*protos.FieldDescription{
+			{
+				Name:         "id",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+			{
+				Name:         "col1",
+				Type:         string(types.QValueKindString),
+				TypeModifier: -1,
+				Nullable:     true,
+			},
+		},
+	}, output[tableName])
+}
+
+func (s PostgresSchemaDeltaTestSuite) TestDropNonExistentColumn() {
+	tableName := s.schema + ".drop_nonexistent_column"
+	_, err := s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("CREATE TABLE %s(id INT PRIMARY KEY, col1 TEXT)", tableName))
+	require.NoError(s.t, err)
+
+	// Try to drop a column that doesn't exist - should not error due to IF EXISTS
+	require.NoError(s.t, s.connector.ReplayTableSchemaDeltas(s.t.Context(), nil, "schema_delta_flow", nil, []*protos.TableSchemaDelta{{
+		SrcTableName: tableName,
+		DstTableName: tableName,
+		DroppedColumns: []*protos.FieldDescription{
+			{
+				Name:         "nonexistent",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+		},
+	}}))
+
+	// Table should be unchanged
+	output, err := s.connector.GetTableSchema(s.t.Context(), nil, shared.InternalVersion_Latest, protos.TypeSystem_Q,
+		[]*protos.TableMapping{{SourceTableIdentifier: tableName}})
+	require.NoError(s.t, err)
+	require.Equal(s.t, &protos.TableSchema{
+		TableIdentifier:   tableName,
+		PrimaryKeyColumns: []string{"id"},
+		System:            protos.TypeSystem_Q,
+		Columns: []*protos.FieldDescription{
+			{
+				Name:         "id",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+			{
+				Name:         "col1",
+				Type:         string(types.QValueKindString),
+				TypeModifier: -1,
+				Nullable:     true,
+			},
+		},
+	}, output[tableName])
+}
+
+func (s PostgresSchemaDeltaTestSuite) TestDropAndAddSameColumn() {
+	tableName := s.schema + ".drop_and_add_same_column"
+	_, err := s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("CREATE TABLE %s(id INT PRIMARY KEY, mycol TEXT)", tableName))
+	require.NoError(s.t, err)
+
+	// Insert some data with text type
+	_, err = s.connector.conn.Exec(s.t.Context(),
+		fmt.Sprintf("INSERT INTO %s(id, mycol) VALUES (1, 'text_value')", tableName))
+	require.NoError(s.t, err)
+
+	// Drop mycol (TEXT) and add mycol (INT) - simulating a column type change
+	require.NoError(s.t, s.connector.ReplayTableSchemaDeltas(s.t.Context(), nil, "schema_delta_flow", nil, []*protos.TableSchemaDelta{{
+		SrcTableName: tableName,
+		DstTableName: tableName,
+		DroppedColumns: []*protos.FieldDescription{
+			{
+				Name:         "mycol",
+				Type:         string(types.QValueKindString),
+				TypeModifier: -1,
+			},
+		},
+		AddedColumns: []*protos.FieldDescription{
+			{
+				Name:         "mycol",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+				Nullable:     true,
+			},
+		},
+	}}))
+
+	output, err := s.connector.GetTableSchema(s.t.Context(), nil, shared.InternalVersion_Latest, protos.TypeSystem_Q,
+		[]*protos.TableMapping{{SourceTableIdentifier: tableName}})
+	require.NoError(s.t, err)
+	require.Equal(s.t, &protos.TableSchema{
+		TableIdentifier:   tableName,
+		PrimaryKeyColumns: []string{"id"},
+		System:            protos.TypeSystem_Q,
+		Columns: []*protos.FieldDescription{
+			{
+				Name:         "id",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+			},
+			{
+				Name:         "mycol",
+				Type:         string(types.QValueKindInt32),
+				TypeModifier: -1,
+				Nullable:     true,
+			},
+		},
+	}, output[tableName])
+
+	// Verify old data was deleted with the column, new column is NULL
+	var id int
+	var mycol *int
+	err = s.connector.conn.QueryRow(s.t.Context(),
+		fmt.Sprintf("SELECT id, mycol FROM %s WHERE id = 1", tableName)).Scan(&id, &mycol)
+	require.NoError(s.t, err)
+	require.Equal(s.t, 1, id)
+	require.Nil(s.t, mycol) // Column was dropped and re-added, so value should be NULL
+}
+
 func TestPostgresSchemaDeltaTestSuite(t *testing.T) {
 	e2eshared.RunSuite(t, SetupSuite)
 }

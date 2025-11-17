@@ -792,9 +792,15 @@ func PullCdcRecords[Items model.Items](
 
 					case *model.RelationRecord[Items]:
 						tableSchemaDelta := r.TableSchemaDelta
-						if len(tableSchemaDelta.AddedColumns) > 0 {
-							logger.Info(fmt.Sprintf("Detected schema change for table %s, addedColumns: %v",
-								tableSchemaDelta.SrcTableName, tableSchemaDelta.AddedColumns))
+						if hasSchemaChanges(tableSchemaDelta) {
+							if len(tableSchemaDelta.AddedColumns) > 0 {
+								logger.Info(fmt.Sprintf("Detected schema change for table %s, addedColumns: %v",
+									tableSchemaDelta.SrcTableName, tableSchemaDelta.AddedColumns))
+							}
+							if len(tableSchemaDelta.DroppedColumns) > 0 {
+								logger.Info(fmt.Sprintf("Detected schema change for table %s, droppedColumns: %v",
+									tableSchemaDelta.SrcTableName, tableSchemaDelta.DroppedColumns))
+							}
 							records.AddSchemaDelta(req.TableNameMapping, tableSchemaDelta)
 						}
 
@@ -1178,8 +1184,15 @@ func processRelationMessage[Items model.Items](
 	for _, column := range prevSchema.Columns {
 		// present in previous relation message, but not in current one, so dropped.
 		if _, ok := currRelMap[column.Name]; !ok {
-			p.logger.Warn(fmt.Sprintf("Detected dropped column %s in table %s, but not propagating", column,
-				schemaDelta.SrcTableName))
+			schemaDelta.DroppedColumns = append(schemaDelta.DroppedColumns, &protos.FieldDescription{
+				Name:         column.Name,
+				Type:         column.Type,
+				TypeModifier: column.TypeModifier,
+			})
+			p.logger.Info("Detected dropped column",
+				slog.String("columnName", column.Name),
+				slog.String("columnType", column.Type),
+				slog.String("relationName", schemaDelta.SrcTableName))
 		}
 	}
 	if len(potentiallyNullableAddedColumns) > 0 {
@@ -1214,13 +1227,19 @@ func processRelationMessage[Items model.Items](
 
 	p.relationMessageMapping[currRel.RelationID] = currRel
 	// only log audit if there is actionable delta
-	if len(schemaDelta.AddedColumns) > 0 {
+	if len(schemaDelta.AddedColumns) > 0 || len(schemaDelta.DroppedColumns) > 0 {
 		return &model.RelationRecord[Items]{
 			BaseRecord:       p.baseRecord(lsn),
 			TableSchemaDelta: schemaDelta,
 		}, monitoring.AuditSchemaDelta(ctx, p.catalogPool.Pool, p.flowJobName, schemaDelta)
 	}
 	return nil, nil
+}
+
+// hasSchemaChanges guards downstream processing so we only emit relation records
+// when there's an actual add/drop, not just a keepalive relation refresh.
+func hasSchemaChanges(delta *protos.TableSchemaDelta) bool {
+	return delta != nil && (len(delta.AddedColumns) > 0 || len(delta.DroppedColumns) > 0)
 }
 
 // getParentRelIDIfPartitioned checks if the relation ID is a child table

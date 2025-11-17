@@ -81,3 +81,96 @@ func BuildProcessedSchemaMapping(
 	}
 	return processedSchemaMapping
 }
+
+func cloneFieldDescription(field *protos.FieldDescription) *protos.FieldDescription {
+	if field == nil {
+		return nil
+	}
+	return &protos.FieldDescription{
+		Name:         field.Name,
+		Type:         field.Type,
+		TypeModifier: field.TypeModifier,
+		Nullable:     field.Nullable,
+	}
+}
+
+func columnsToMap(columns []*protos.FieldDescription) map[string]*protos.FieldDescription {
+	result := make(map[string]*protos.FieldDescription, len(columns))
+	for _, column := range columns {
+		result[column.Name] = column
+	}
+	return result
+}
+
+func fieldDescriptionsEqual(a, b *protos.FieldDescription) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Name == b.Name && a.Type == b.Type && a.TypeModifier == b.TypeModifier && a.Nullable == b.Nullable
+}
+
+// ComputeSchemaDrift compares the persisted schema mapping with the latest schema fetched from source.
+// It returns schema deltas that can be replayed at the destination to reconcile the difference.
+func ComputeSchemaDrift(
+	tableMappings []*protos.TableMapping,
+	current map[string]*protos.TableSchema,
+	latest map[string]*protos.TableSchema,
+) []*protos.TableSchemaDelta {
+	if len(tableMappings) == 0 || len(latest) == 0 {
+		return nil
+	}
+
+	mappingByDst := make(map[string]*protos.TableMapping, len(tableMappings))
+	for _, tm := range tableMappings {
+		mappingByDst[tm.DestinationTableIdentifier] = tm
+	}
+
+	deltas := make([]*protos.TableSchemaDelta, 0, len(latest))
+	for dstName, latestSchema := range latest {
+		mapping, ok := mappingByDst[dstName]
+		if !ok {
+			continue
+		}
+
+		currentSchema, ok := current[dstName]
+		if !ok || currentSchema == nil || latestSchema == nil {
+			continue
+		}
+
+		currentCols := columnsToMap(currentSchema.Columns)
+		latestCols := columnsToMap(latestSchema.Columns)
+
+		var added []*protos.FieldDescription
+		for colName, latestCol := range latestCols {
+			if existing, ok := currentCols[colName]; !ok {
+				added = append(added, cloneFieldDescription(latestCol))
+			} else if !fieldDescriptionsEqual(existing, latestCol) {
+				added = append(added, cloneFieldDescription(latestCol))
+			}
+		}
+
+		var dropped []*protos.FieldDescription
+		for colName, currentCol := range currentCols {
+			if latestCol, ok := latestCols[colName]; !ok {
+				dropped = append(dropped, cloneFieldDescription(currentCol))
+			} else if !fieldDescriptionsEqual(currentCol, latestCol) {
+				dropped = append(dropped, cloneFieldDescription(currentCol))
+			}
+		}
+
+		if len(added) == 0 && len(dropped) == 0 {
+			continue
+		}
+
+		deltas = append(deltas, &protos.TableSchemaDelta{
+			SrcTableName:    mapping.SourceTableIdentifier,
+			DstTableName:    dstName,
+			AddedColumns:    added,
+			DroppedColumns:  dropped,
+			System:          latestSchema.System,
+			NullableEnabled: latestSchema.NullableEnabled,
+		})
+	}
+
+	return deltas
+}
