@@ -1213,6 +1213,18 @@ func (s PeerFlowE2ETestSuitePG) Test_Mixed_Case_Schema_Changes_PG() {
 		return s.comparePGTables(quotedSourceTableName, quotedDestTableName,
 			"id,c1,c3") == nil
 	})
+
+	// verify that myC2 column was actually dropped on the destination
+	var columnExists bool
+	err = s.Conn().QueryRow(s.t.Context(), fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'e2e_test_%s' AND table_name = '%s' AND column_name = 'myC2'
+		)`, s.suffix, dstTableName)).Scan(&columnExists)
+	EnvNoError(s.t, env, err)
+	require.False(s.t, columnExists, "Column myC2 should have been dropped from destination table")
+	s.t.Log("Verified that myC2 column was dropped from destination table")
+
 	// alter source table, drop column c3 and insert another row.
 	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
 		ALTER TABLE %s DROP COLUMN c3`, quotedSourceTableName))
@@ -1228,6 +1240,17 @@ func (s PeerFlowE2ETestSuitePG) Test_Mixed_Case_Schema_Changes_PG() {
 		return s.comparePGTables(quotedSourceTableName, quotedDestTableName,
 			"id,c1") == nil
 	})
+
+	// verify that c3 column was actually dropped on the destination
+	err = s.Conn().QueryRow(s.t.Context(), fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'e2e_test_%s' AND table_name = '%s' AND column_name = 'c3'
+		)`, s.suffix, dstTableName)).Scan(&columnExists)
+	EnvNoError(s.t, env, err)
+	require.False(s.t, columnExists, "Column c3 should have been dropped from destination table")
+	s.t.Log("Verified that c3 column was dropped from destination table")
+
 	env.Cancel(s.t.Context())
 	RequireEnvCanceled(s.t, env)
 }
@@ -1358,6 +1381,138 @@ func (s PeerFlowE2ETestSuitePG) Test_Index_Replication() {
 
 	EnvWaitFor(s.t, env, 3*time.Minute, "normalize records", func() bool {
 		return s.comparePGTables(srcTableName, dstTableName, "id,email,created_at,data") == nil
+	})
+
+	env.Cancel(s.t.Context())
+	RequireEnvCanceled(s.t, env)
+}
+
+func (s PeerFlowE2ETestSuitePG) Test_Trigger_Replication() {
+	srcTableName := s.attachSchemaSuffix("test_trigger_replication")
+	dstTableName := s.attachSchemaSuffix("test_trigger_replication_dst")
+
+	_, err := s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id SERIAL PRIMARY KEY,
+			email TEXT NOT NULL,
+			updated_at TIMESTAMP,
+			email_log TEXT
+		);
+	`, srcTableName))
+	require.NoError(s.t, err)
+
+	// Create trigger function for updating timestamp
+	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION update_timestamp_%s()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			NEW.updated_at = NOW();
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+	`, s.suffix))
+	require.NoError(s.t, err)
+
+	// Create trigger function for logging email changes
+	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION log_email_change_%s()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			NEW.email_log = 'Email changed to: ' || NEW.email;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+	`, s.suffix))
+	require.NoError(s.t, err)
+
+	// Create triggers on source table
+	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		CREATE TRIGGER update_timestamp_trigger
+		BEFORE UPDATE ON %s
+		FOR EACH ROW
+		EXECUTE FUNCTION update_timestamp_%s();
+
+		CREATE TRIGGER log_email_trigger
+		BEFORE INSERT OR UPDATE ON %s
+		FOR EACH ROW
+		EXECUTE FUNCTION log_email_change_%s();
+	`, srcTableName, s.suffix, srcTableName, s.suffix))
+	require.NoError(s.t, err)
+
+	// Create trigger functions on destination (required for trigger replication)
+	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		CREATE OR REPLACE FUNCTION update_timestamp_%s()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			NEW.updated_at = NOW();
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+
+		CREATE OR REPLACE FUNCTION log_email_change_%s()
+		RETURNS TRIGGER AS $$
+		BEGIN
+			NEW.email_log = 'Email changed to: ' || NEW.email;
+			RETURN NEW;
+		END;
+		$$ LANGUAGE plpgsql;
+	`, s.suffix, s.suffix))
+	require.NoError(s.t, err)
+
+	connectionGen := FlowConnectionGenerationConfig{
+		FlowJobName:      s.attachSuffix("test_trigger_replication_flow"),
+		TableNameMapping: map[string]string{srcTableName: dstTableName},
+		Destination:      s.Peer().Name,
+	}
+
+	flowConnConfig := connectionGen.GenerateFlowConnectionConfigs(s)
+	flowConnConfig.MaxBatchSize = 100
+
+	tc := NewTemporalClient(s.t)
+	env := ExecutePeerflow(s.t, tc, flowConnConfig)
+
+	SetupCDCFlowStatusQuery(s.t, env, flowConnConfig)
+
+	// Verify triggers were created on destination table
+	var triggerCount int
+	err = s.Conn().QueryRow(s.t.Context(), fmt.Sprintf(`
+		SELECT COUNT(*)
+		FROM pg_trigger t
+		JOIN pg_class c ON t.tgrelid = c.oid
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		WHERE n.nspname = 'e2e_test_%s'
+		AND c.relname = '%s'
+		AND NOT t.tgisinternal
+	`, s.suffix, "test_trigger_replication_dst")).Scan(&triggerCount)
+	require.NoError(s.t, err)
+	require.Equal(s.t, 2, triggerCount, "expected 2 triggers on destination table")
+
+	// Verify specific triggers exist
+	var exists bool
+	err = s.Conn().QueryRow(s.t.Context(), fmt.Sprintf(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM pg_trigger t
+			JOIN pg_class c ON t.tgrelid = c.oid
+			JOIN pg_namespace n ON c.relnamespace = n.oid
+			WHERE n.nspname = 'e2e_test_%s'
+			AND c.relname = '%s'
+			AND t.tgname = 'update_timestamp_trigger'
+		)
+	`, s.suffix, "test_trigger_replication_dst")).Scan(&exists)
+	require.NoError(s.t, err)
+	require.True(s.t, exists, "update_timestamp_trigger should exist on destination")
+
+	// Insert some data and verify the mirror works
+	_, err = s.Conn().Exec(s.t.Context(), fmt.Sprintf(`
+		INSERT INTO %s(email) VALUES
+		('test1@example.com'),
+		('test2@example.com')
+	`, srcTableName))
+	EnvNoError(s.t, env, err)
+
+	EnvWaitFor(s.t, env, 3*time.Minute, "normalize records", func() bool {
+		return s.comparePGTables(srcTableName, dstTableName, "id,email,updated_at,email_log") == nil
 	})
 
 	env.Cancel(s.t.Context())
