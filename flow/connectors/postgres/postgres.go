@@ -1283,19 +1283,43 @@ func (c *PostgresConnector) ReplayTableSchemaDeltas(
 	defer shared.RollbackTx(tableSchemaModifyTx, c.logger)
 
 	for _, schemaDelta := range schemaDeltas {
-		if schemaDelta == nil || len(schemaDelta.AddedColumns) == 0 {
+		if schemaDelta == nil || (len(schemaDelta.AddedColumns) == 0 && len(schemaDelta.DroppedColumns) == 0) {
 			continue
+		}
+
+		dstSchemaTable, err := utils.ParseSchemaTable(schemaDelta.DstTableName)
+		if err != nil {
+			return fmt.Errorf("error parsing schema and table for %s: %w", schemaDelta.DstTableName, err)
+		}
+
+		// Process dropped columns FIRST before adding new ones
+		// This handles the case where a column is dropped and a new one with the same name is added
+		for _, droppedColumn := range schemaDelta.DroppedColumns {
+			_, err = c.execWithLoggingTx(ctx, fmt.Sprintf(
+				"ALTER TABLE %s.%s DROP COLUMN IF EXISTS %s",
+				utils.QuoteIdentifier(dstSchemaTable.Schema),
+				utils.QuoteIdentifier(dstSchemaTable.Table),
+				utils.QuoteIdentifier(droppedColumn.Name)), tableSchemaModifyTx)
+			if err != nil {
+				c.logger.Warn(fmt.Sprintf("[schema delta replay] failed to drop column %s for table %s: %v",
+					droppedColumn.Name, schemaDelta.DstTableName, err),
+					slog.String("srcTableName", schemaDelta.SrcTableName),
+					slog.String("dstTableName", schemaDelta.DstTableName),
+				)
+				// Continue with other columns even if drop fails
+				continue
+			}
+			c.logger.Info(fmt.Sprintf("[schema delta replay] dropped column %s",
+				droppedColumn.Name),
+				slog.String("srcTableName", schemaDelta.SrcTableName),
+				slog.String("dstTableName", schemaDelta.DstTableName),
+			)
 		}
 
 		for _, addedColumn := range schemaDelta.AddedColumns {
 			columnType := addedColumn.Type
 			if schemaDelta.System == protos.TypeSystem_Q {
 				columnType = qValueKindToPostgresType(columnType)
-			}
-
-			dstSchemaTable, err := utils.ParseSchemaTable(schemaDelta.DstTableName)
-			if err != nil {
-				return fmt.Errorf("error parsing schema and table for %s: %w", schemaDelta.DstTableName, err)
 			}
 
 			_, err = c.execWithLoggingTx(ctx, fmt.Sprintf(
