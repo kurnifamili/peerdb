@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"strings"
 	"sync"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -40,22 +42,25 @@ type ReplState struct {
 }
 
 type PostgresConnector struct {
-	logger                 log.Logger
-	customTypeMapping      map[uint32]shared.CustomDataType
-	ssh                    *utils.SSHTunnel
-	conn                   *pgx.Conn
-	replConn               *pgx.Conn
-	replState              *ReplState
-	Config                 *protos.PostgresConfig
-	hushWarnOID            map[uint32]struct{}
-	relationMessageMapping model.RelationMessageMapping
-	typeMap                *pgtype.Map
-	rdsAuth                *utils.RDSAuth
-	connStr                string
-	metadataSchema         string
-	replLock               sync.Mutex
-	pgVersion              shared.PGVersion
+	logger                      log.Logger
+	customTypeMapping           map[uint32]shared.CustomDataType
+	ssh                         *utils.SSHTunnel
+	conn                        *pgx.Conn
+	replConn                    *pgx.Conn
+	replState                   *ReplState
+	Config                      *protos.PostgresConfig
+	hushWarnOID                 map[uint32]struct{}
+	relationMessageMapping      model.RelationMessageMapping
+	typeMap                     *pgtype.Map
+	rdsAuth                     *utils.RDSAuth
+	connStr                     string
+	metadataSchema              string
+	replLock                    sync.Mutex
+	pgVersion                   shared.PGVersion
+	optionalDDLSavepointCounter atomic.Uint64
 }
+
+const postgresIdentifierMaxLength = 63
 
 func NewPostgresConnector(ctx context.Context, env map[string]string, pgConfig *protos.PostgresConfig) (*PostgresConnector, error) {
 	logger := internal.LoggerFromCtx(ctx)
@@ -1183,13 +1188,34 @@ func (c *PostgresConnector) setupIndexes(
 
 	for _, idx := range nonPrimaryIndexes {
 		// Modify index definition to use destination table name
-		indexDef := strings.ReplaceAll(idx.IndexDef, srcSchemaTable.String(), parsedNormalizedTable.String())
+		indexDef := rewriteTableIdentifierInSQL(idx.IndexDef, srcSchemaTable, parsedNormalizedTable)
 
 		c.logger.Info("[postgres] creating index",
 			slog.String("index", idx.IndexName),
 			slog.String("table", tableIdentifier))
 
-		if _, err := c.execWithLoggingTx(ctx, indexDef, tx); err != nil {
+		if err := c.execOptionalDDL(ctx, tx, indexDef); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == pgerrcode.DuplicateTable {
+				// Destination schemas might already have an index with the same name,
+				// so deterministically rename our copy instead of failing the whole setup.
+				dstIndexName := buildDestinationIndexName(idx.IndexName, parsedNormalizedTable)
+				renamedDef := rewriteIndexNameInSQL(indexDef, srcSchemaTable, parsedNormalizedTable, idx.IndexName, dstIndexName)
+				c.logger.Info("[postgres] detected duplicate index name, retrying with renamed index",
+					slog.String("sourceIndex", idx.IndexName),
+					slog.String("destinationIndex", dstIndexName),
+					slog.String("table", tableIdentifier))
+
+				if retryErr := c.execOptionalDDL(ctx, tx, renamedDef); retryErr != nil {
+					c.logger.Warn("[postgres] failed to create index after renaming, continuing",
+						slog.String("sourceIndex", idx.IndexName),
+						slog.String("destinationIndex", dstIndexName),
+						slog.String("table", tableIdentifier),
+						slog.Any("error", retryErr))
+				}
+				continue
+			}
+
 			c.logger.Warn("[postgres] failed to create index, continuing",
 				slog.String("index", idx.IndexName),
 				slog.String("table", tableIdentifier),
@@ -1242,13 +1268,13 @@ func (c *PostgresConnector) setupTriggers(
 
 	for _, trigger := range triggers {
 		// Modify trigger definition to use destination table name
-		triggerDef := strings.ReplaceAll(trigger.TriggerDef, srcSchemaTable.String(), parsedNormalizedTable.String())
+		triggerDef := rewriteTableIdentifierInSQL(trigger.TriggerDef, srcSchemaTable, parsedNormalizedTable)
 
 		c.logger.Info("[postgres] creating trigger",
 			slog.String("trigger", trigger.TriggerName),
 			slog.String("table", tableIdentifier))
 
-		if _, err := c.execWithLoggingTx(ctx, triggerDef, tx); err != nil {
+		if err := c.execOptionalDDL(ctx, tx, triggerDef); err != nil {
 			c.logger.Warn("[postgres] failed to create trigger, continuing",
 				slog.String("trigger", trigger.TriggerName),
 				slog.String("table", tableIdentifier),
@@ -1256,6 +1282,114 @@ func (c *PostgresConnector) setupTriggers(
 			// Don't fail if a single trigger fails to create
 			// This could happen if trigger functions are missing on destination
 		}
+	}
+
+	return nil
+}
+
+// rewriteTableIdentifierInSQL swaps every known representation of the source table
+// with the destination equivalent so we can re-use index/trigger definitions verbatim.
+func rewriteTableIdentifierInSQL(sql string, src, dst *utils.SchemaTable) string {
+	replacements := []struct{ old, new string }{
+		{src.String(), dst.String()},
+		{fmt.Sprintf("%s.%s", src.Schema, src.Table), fmt.Sprintf("%s.%s", dst.Schema, dst.Table)},
+		{fmt.Sprintf("%s.%s", utils.QuoteIdentifier(src.Schema), src.Table), fmt.Sprintf("%s.%s", utils.QuoteIdentifier(dst.Schema), dst.Table)},
+		{fmt.Sprintf("%s.%s", src.Schema, utils.QuoteIdentifier(src.Table)), fmt.Sprintf("%s.%s", dst.Schema, utils.QuoteIdentifier(dst.Table))},
+	}
+
+	for _, replacement := range replacements {
+		if replacement.old == replacement.new {
+			continue
+		}
+		sql = strings.ReplaceAll(sql, replacement.old, replacement.new)
+	}
+
+	return sql
+}
+
+// rewriteIndexNameInSQL renames a CREATE INDEX statement while attempting to respect
+// whatever quoting style the original definition used.
+func rewriteIndexNameInSQL(sql string, src, dst *utils.SchemaTable, originalName, replacementName string) string {
+	sanitizedOriginal := sanitizeIdentifier(originalName)
+	sanitizedReplacement := sanitizeIdentifier(replacementName)
+	replacements := []struct{ old, new string }{
+		{fmt.Sprintf("\"%s\".\"%s\"", src.Schema, sanitizedOriginal), fmt.Sprintf("\"%s\".\"%s\"", dst.Schema, sanitizedReplacement)},
+		{fmt.Sprintf("\"%s\".%s", src.Schema, sanitizedOriginal), fmt.Sprintf("\"%s\".%s", dst.Schema, sanitizedReplacement)},
+		{fmt.Sprintf("%s.\"%s\"", src.Schema, sanitizedOriginal), fmt.Sprintf("%s.\"%s\"", dst.Schema, sanitizedReplacement)},
+		{fmt.Sprintf("%s.%s", src.Schema, sanitizedOriginal), fmt.Sprintf("%s.%s", dst.Schema, sanitizedReplacement)},
+		{fmt.Sprintf("\"%s\"", sanitizedOriginal), fmt.Sprintf("\"%s\"", sanitizedReplacement)},
+		{sanitizedOriginal, sanitizedReplacement},
+	}
+
+	for _, replacement := range replacements {
+		if replacement.old == replacement.new {
+			continue
+		}
+		if strings.Contains(sql, replacement.old) {
+			return strings.Replace(sql, replacement.old, replacement.new, 1)
+		}
+	}
+
+	return sql
+}
+
+// sanitizeIdentifier strips schema prefixes and quotes so helper functions can
+// reason about the raw PostgreSQL identifier.
+func sanitizeIdentifier(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if dot := strings.LastIndex(trimmed, "."); dot != -1 {
+		trimmed = trimmed[dot+1:]
+	}
+	return strings.Trim(trimmed, "\"")
+}
+
+// buildDestinationIndexName produces a deterministic name that includes the destination
+// schema/table while staying below PostgreSQL's 63-character identifier limit.
+func buildDestinationIndexName(sourceName string, dst *utils.SchemaTable) string {
+	sanitizedSource := sanitizeIdentifier(sourceName)
+	if sanitizedSource == "" {
+		sanitizedSource = "peerdb_idx"
+	}
+	suffix := fmt.Sprintf("%s_%s", dst.Schema, dst.Table)
+	candidate := fmt.Sprintf("%s__%s", sanitizedSource, suffix)
+	if len(candidate) <= postgresIdentifierMaxLength {
+		return candidate
+	}
+
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(candidate))
+	hashSuffix := fmt.Sprintf("%x", hasher.Sum32())
+	maxPrefixLen := postgresIdentifierMaxLength - len(hashSuffix) - 1
+	if maxPrefixLen < 1 {
+		maxPrefixLen = 1
+	}
+	runes := []rune(candidate)
+	if len(runes) > maxPrefixLen {
+		runes = runes[:maxPrefixLen]
+	}
+	return fmt.Sprintf("%s_%s", string(runes), hashSuffix)
+}
+
+// execOptionalDDL wraps index/trigger creation in a SAVEPOINT so failures don't abort
+// the entire table setup transaction. We only bubble up the original error.
+func (c *PostgresConnector) execOptionalDDL(ctx context.Context, tx pgx.Tx, ddl string) error {
+	savepointName := fmt.Sprintf("peerdb_optional_%d", c.optionalDDLSavepointCounter.Add(1))
+	if _, err := tx.Exec(ctx, fmt.Sprintf("SAVEPOINT %s", savepointName)); err != nil {
+		return fmt.Errorf("failed to create savepoint %s: %w", savepointName, err)
+	}
+
+	if _, err := c.execWithLoggingTx(ctx, ddl, tx); err != nil {
+		if _, rbErr := tx.Exec(ctx, fmt.Sprintf("ROLLBACK TO SAVEPOINT %s", savepointName)); rbErr != nil {
+			return fmt.Errorf("failed to rollback to savepoint %s after error (%v): %w", savepointName, err, rbErr)
+		}
+		if _, relErr := tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", savepointName)); relErr != nil {
+			return fmt.Errorf("failed to release savepoint %s after rollback: %w", savepointName, relErr)
+		}
+		return err
+	}
+
+	if _, err := tx.Exec(ctx, fmt.Sprintf("RELEASE SAVEPOINT %s", savepointName)); err != nil {
+		return fmt.Errorf("failed to release savepoint %s: %w", savepointName, err)
 	}
 
 	return nil
